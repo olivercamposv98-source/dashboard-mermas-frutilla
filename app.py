@@ -302,35 +302,21 @@ def kpi(label, value, sub="", cls="kpi-accent"):
         f"<div class='kpi-sub'>{sub}</div></div>"
     )
 
-r1 = st.columns(4)
-r1[0].markdown(kpi("KG Recepcionados", f"{kg_ingreso:,.0f}",
-                   f"Bs {costo_ingreso:,.0f} comprado", "kpi-accent"),
-               unsafe_allow_html=True)
-r1[1].markdown(kpi("KG Devueltos", f"{kg_devol:,.0f}",
-                   f"{pct_devol:.1f}% · Bs {costo_devol:,.0f} (no es pérdida)",
-                   "kpi-yellow"),
-               unsafe_allow_html=True)
-r1[2].markdown(kpi("KG Utilizable", f"{kg_utilizable:,.0f}",
-                   "Ingreso − Devolución", "kpi-green"),
-               unsafe_allow_html=True)
-r1[3].markdown(kpi("KG Merma Limpieza", f"{kg_merma:,.0f}",
-                   f"Bs {costo_merma:,.0f} perdidos", "kpi-red"),
-               unsafe_allow_html=True)
-
-r2 = st.columns(4)
 cls_merma = "kpi-red" if pct_merma_util >= UMBRAL_CRIT else (
     "kpi-yellow" if pct_merma_util >= UMBRAL_ALERT else "kpi-green")
-r2[0].markdown(kpi("% Merma s/ Utilizable", f"{pct_merma_util:.1f}%",
-                   "Definición oficial (sobre utilizable)", cls_merma),
+
+r1 = st.columns(4)
+r1[0].markdown(kpi("KG Utilizable", f"{kg_utilizable:,.0f}",
+                   f"de {kg_ingreso:,.0f} kg recepcionados", "kpi-accent"),
                unsafe_allow_html=True)
-r2[1].markdown(kpi("% Merma s/ Recepcionado", f"{pct_merma_global:.1f}%",
-                   "Referencia sobre total recibido", "kpi-accent"),
+r1[1].markdown(kpi("KG Merma Limpieza", f"{kg_merma:,.0f}",
+                   f"Bs {costo_merma:,.0f} perdidos", "kpi-red"),
                unsafe_allow_html=True)
-r2[2].markdown(kpi("Run Rate Merma / mes", f"Bs {runrate_merma_bs:,.0f}",
-                   f"≈ {runrate_merma_kg:,.0f} kg/mes", "kpi-red"),
+r1[2].markdown(kpi("% Merma s/ Utilizable", f"{pct_merma_util:.1f}%",
+                   "Meta 10–11% · 🔴 crítico > 13.5%", cls_merma),
                unsafe_allow_html=True)
-r2[3].markdown(kpi("Run Rate Devol. / mes", f"Bs {runrate_devol_bs:,.0f}",
-                   f"≈ {runrate_devol_kg:,.0f} kg/mes", "kpi-yellow"),
+r1[3].markdown(kpi("Run Rate Merma / mes", f"Bs {runrate_merma_bs:,.0f}",
+                   f"≈ {runrate_merma_kg:,.0f} kg/mes proyectado", "kpi-red"),
                unsafe_allow_html=True)
 
 st.markdown("---")
@@ -512,39 +498,6 @@ st.dataframe(tbl, use_container_width=True, hide_index=True)
 st.markdown("---")
 
 # ──────────────────────────────────────────────────────────────────────────
-# HEATMAP proveedor × tipo de merma
-# ──────────────────────────────────────────────────────────────────────────
-st.subheader("🔥 Heatmap · Proveedor × tipo de merma")
-
-hm_metric = st.radio("Métrica del heatmap", ["KG", "Bs (costo)"],
-                     horizontal=True, key="hm")
-val_col = "CANTIDAD" if hm_metric == "KG" else "COSTO"
-hm_src = d[d["ESTADO_N"].isin(["DEVOLUCION", "MERMA_LIMPIEZA"])]
-hm = hm_src.pivot_table(index="PROVEEDOR", columns="ESTADO_N",
-                        values=val_col, aggfunc="sum", fill_value=0)
-hm = hm.rename(columns={"DEVOLUCION": "Devolución",
-                        "MERMA_LIMPIEZA": "Merma limpieza"})
-for c in ["Devolución", "Merma limpieza"]:
-    if c not in hm.columns:
-        hm[c] = 0
-hm = hm[["Devolución", "Merma limpieza"]]
-
-txt = [[f"Bs {v:,.0f}" if hm_metric != "KG" else f"{v:,.0f}" for v in row]
-       for row in hm.values]
-fig_hm = go.Figure(go.Heatmap(
-    z=hm.values, x=hm.columns.tolist(), y=hm.index.tolist(),
-    text=txt, texttemplate="%{text}",
-    colorscale=[[0, C_PANEL], [0.5, "#0E7490"], [1, C_CYAN]],
-    showscale=True))
-fig_hm.update_layout(template=PLOTLY_TEMPLATE,
-                     height=80 + 55 * max(len(hm), 1),
-                     paper_bgcolor="rgba(0,0,0,0)",
-                     margin=dict(l=10, r=10, t=20, b=10))
-st.plotly_chart(fig_hm, use_container_width=True)
-
-st.markdown("---")
-
-# ──────────────────────────────────────────────────────────────────────────
 # SEMANA VS SEMANA
 # ──────────────────────────────────────────────────────────────────────────
 st.subheader("📊 Comparativo semana vs semana")
@@ -579,32 +532,6 @@ fig_w.update_layout(
 st.plotly_chart(fig_w, use_container_width=True)
 
 st.markdown("---")
-
-# ──────────────────────────────────────────────────────────────────────────
-# HISTÓRICO · días con más merma
-# ──────────────────────────────────────────────────────────────────────────
-st.subheader("🗓️ Histórico · días con mayor merma de limpieza")
-
-hist = (d[d["ESTADO_N"] == "MERMA_LIMPIEZA"]
-        .groupby(d["FECHA"].dt.date)
-        .agg(KG=("CANTIDAD", "sum"), Bs=("COSTO", "sum"))
-        .reset_index().rename(columns={"FECHA": "DIA"}))
-if "DIA" not in hist.columns:
-    hist = hist.rename(columns={hist.columns[0]: "DIA"})
-hist = hist.sort_values("KG", ascending=False).head(15).sort_values("KG")
-
-fig_h = go.Figure(go.Bar(
-    x=hist["KG"], y=hist["DIA"].astype(str), orientation="h",
-    marker_color=C_RED,
-    text=[f"{k:,.0f} kg · Bs {b:,.0f}" for k, b in zip(hist["KG"], hist["Bs"])],
-    textposition="outside"))
-fig_h.update_layout(template=PLOTLY_TEMPLATE, height=480,
-                    title="Top 15 días de mayor merma",
-                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    margin=dict(l=10, r=80, t=40, b=10),
-                    xaxis=dict(title="KG merma", gridcolor=C_GRID),
-                    yaxis=dict(gridcolor=C_GRID))
-st.plotly_chart(fig_h, use_container_width=True)
 
 st.caption(
     "Nota metodológica: el **% de merma por limpieza** se calcula sobre el "
