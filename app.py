@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
+import plotly.io as pio
 
 # ──────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN GENERAL
@@ -46,6 +47,12 @@ C_MUTED = "#94A3B8"
 C_GRID = "#1E293B"
 
 PLOTLY_TEMPLATE = "plotly_dark"
+
+# Tooltip legible en todos los gráficos (fondo sólido + texto claro)
+pio.templates[PLOTLY_TEMPLATE].layout.hoverlabel = dict(
+    bgcolor=C_PANEL, bordercolor=C_CYAN,
+    font=dict(color=C_TEXT, size=13, family="sans serif"),
+)
 
 # ──────────────────────────────────────────────────────────────────────────
 # ESTILOS
@@ -291,6 +298,27 @@ runrate_merma_bs = costo_merma / dias_rango * 30
 runrate_devol_kg = kg_devol / dias_rango * 30
 runrate_devol_bs = costo_devol / dias_rango * 30
 
+# Proyección de cierre del mes en curso (mes más reciente dentro del filtro)
+ult_fecha = d["FECHA"].max()
+periodo_mes = ult_fecha.to_period("M")
+md = d[d["FECHA"].dt.to_period("M") == periodo_mes]
+md_ing = agg_kg(md, "INGRESO")
+md_dev = agg_kg(md, "DEVOLUCION")
+md_mer = agg_kg(md, "MERMA_LIMPIEZA")
+md_util = md_ing - md_dev
+# A ritmo constante el % de cierre = % acumulado del mes a la fecha
+pct_proj_mes = (md_mer / md_util * 100) if md_util else 0.0
+dias_mes = periodo_mes.days_in_month
+dia_actual = max(ult_fecha.day, 1)
+factor_mes = dias_mes / dia_actual
+proj_merma_kg_mes = md_mer * factor_mes
+proj_merma_bs_mes = agg_costo(md, "MERMA_LIMPIEZA") * factor_mes
+cls_proj = ("kpi-red" if pct_proj_mes >= UMBRAL_CRIT else
+            "kpi-yellow" if pct_proj_mes >= UMBRAL_ALERT else "kpi-green")
+NOMBRE_MES = {1: "ene", 2: "feb", 3: "mar", 4: "abr", 5: "may", 6: "jun",
+              7: "jul", 8: "ago", 9: "sep", 10: "oct", 11: "nov", 12: "dic"}
+mes_lbl = f"{NOMBRE_MES[ult_fecha.month]} {ult_fecha.year}"
+
 # ──────────────────────────────────────────────────────────────────────────
 # KPIs
 # ──────────────────────────────────────────────────────────────────────────
@@ -305,7 +333,7 @@ def kpi(label, value, sub="", cls="kpi-accent"):
 cls_merma = "kpi-red" if pct_merma_util >= UMBRAL_CRIT else (
     "kpi-yellow" if pct_merma_util >= UMBRAL_ALERT else "kpi-green")
 
-r1 = st.columns(4)
+r1 = st.columns(5)
 r1[0].markdown(kpi("KG Utilizable", f"{kg_utilizable:,.0f}",
                    f"de {kg_ingreso:,.0f} kg recepcionados", "kpi-accent"),
                unsafe_allow_html=True)
@@ -317,6 +345,9 @@ r1[2].markdown(kpi("% Merma s/ Utilizable", f"{pct_merma_util:.1f}%",
                unsafe_allow_html=True)
 r1[3].markdown(kpi("Run Rate Merma / mes", f"Bs {runrate_merma_bs:,.0f}",
                    f"≈ {runrate_merma_kg:,.0f} kg/mes proyectado", "kpi-red"),
+               unsafe_allow_html=True)
+r1[4].markdown(kpi("Proyección cierre mes", f"{pct_proj_mes:.1f}%",
+                   f"{mes_lbl} · ~Bs {proj_merma_bs_mes:,.0f} merma", cls_proj),
                unsafe_allow_html=True)
 
 st.markdown("---")
@@ -439,8 +470,13 @@ for p in sorted(d["PROVEEDOR"].unique()):
     dev = agg_kg(sub, "DEVOLUCION")
     mer = agg_kg(sub, "MERMA_LIMPIEZA")
     util = ing - dev
+    ing_rows = sub[sub["ESTADO_N"] == "INGRESO"]
+    kg_i = ing_rows["CANTIDAD"].sum()
+    precio_prom = (((ing_rows["CANTIDAD"] * ing_rows["PRECIO"]).sum() / kg_i)
+                   if kg_i else np.nan)
     prov_rows.append({
         "Proveedor": p,
+        "Precio Bs/kg": precio_prom,
         "KG Ingreso": ing,
         "KG Devuelto": dev,
         "KG Utilizable": util,
@@ -487,6 +523,8 @@ with rk2:
 
 # Tabla detalle proveedores
 tbl = prov_df.copy()
+tbl["Precio Bs/kg"] = tbl["Precio Bs/kg"].map(
+    lambda v: f"Bs {v:,.2f}" if pd.notna(v) else "—")
 tbl["% Merma (util)"] = tbl["% Merma (util)"].map(lambda v: f"{v:.1f}%")
 tbl["% Devol."] = tbl["% Devol."].map(lambda v: f"{v:.1f}%")
 for c in ["KG Ingreso", "KG Devuelto", "KG Utilizable", "KG Merma"]:
@@ -494,6 +532,75 @@ for c in ["KG Ingreso", "KG Devuelto", "KG Utilizable", "KG Merma"]:
 for c in ["Costo Merma Bs", "Costo Devol. Bs"]:
     tbl[c] = tbl[c].map(lambda v: f"Bs {v:,.0f}")
 st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+st.markdown("---")
+
+# ──────────────────────────────────────────────────────────────────────────
+# PRECIO VS CALIDAD POR PROVEEDOR
+# ──────────────────────────────────────────────────────────────────────────
+st.subheader("💰 Precio vs calidad · ¿quién nos vende mejor?")
+st.caption("Precio = promedio ponderado de compra por kg. El mejor proveedor "
+           "combina menor precio con menor merma y devolución sobre lo que llega.")
+
+pv = prov_df.dropna(subset=["Precio Bs/kg"]).copy()
+denom_kg = pv["KG Ingreso"].max() or 1
+
+pc1, pc2 = st.columns(2)
+with pc1:
+    pv_s = pv.sort_values("Precio Bs/kg", ascending=False)
+    fig_pp = go.Figure(go.Bar(
+        x=pv_s["Precio Bs/kg"], y=pv_s["Proveedor"], orientation="h",
+        marker_color=C_CYAN,
+        text=[f"Bs {v:,.2f}/kg" for v in pv_s["Precio Bs/kg"]],
+        textposition="outside",
+        hovertemplate="%{y}<br>Precio prom: Bs %{x:,.2f}/kg<extra></extra>"))
+    fig_pp.update_layout(template=PLOTLY_TEMPLATE, height=320,
+                         title="Precio promedio de compra (Bs/kg)",
+                         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                         margin=dict(l=10, r=70, t=40, b=10),
+                         xaxis=dict(gridcolor=C_GRID),
+                         yaxis=dict(gridcolor=C_GRID))
+    st.plotly_chart(fig_pp, use_container_width=True)
+
+with pc2:
+    sc_colors = [C_RED if v >= UMBRAL_CRIT else C_YELLOW if v >= UMBRAL_ALERT
+                 else C_GREEN for v in pv["% Merma (util)"]]
+    fig_sc = go.Figure(go.Scatter(
+        x=pv["Precio Bs/kg"], y=pv["% Merma (util)"], mode="markers+text",
+        text=pv["Proveedor"], textposition="top center",
+        textfont=dict(color=C_TEXT),
+        marker=dict(size=(pv["KG Ingreso"] / denom_kg * 45 + 14),
+                    color=sc_colors, line=dict(color=C_BG, width=1),
+                    opacity=0.85),
+        customdata=np.stack([pv["% Devol."], pv["KG Ingreso"]], axis=-1),
+        hovertemplate=("<b>%{text}</b><br>Precio: Bs %{x:,.2f}/kg<br>"
+                       "%% Merma util: %{y:.1f}%<br>"
+                       "%% Devolución: %{customdata[0]:.1f}%<br>"
+                       "KG ingreso: %{customdata[1]:,.0f}<extra></extra>")))
+    fig_sc.add_hline(y=UMBRAL_ALERT, line_dash="dot", line_color=C_YELLOW)
+    fig_sc.add_hline(y=UMBRAL_CRIT, line_dash="dash", line_color=C_RED)
+    fig_sc.update_layout(template=PLOTLY_TEMPLATE, height=320,
+                         title="Precio vs % merma (tamaño = volumen recibido)",
+                         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                         margin=dict(l=10, r=20, t=40, b=10),
+                         xaxis=dict(title="Precio Bs/kg", gridcolor=C_GRID),
+                         yaxis=dict(title="% Merma util", gridcolor=C_GRID,
+                                    ticksuffix="%"))
+    st.plotly_chart(fig_sc, use_container_width=True)
+
+# Mejor relación precio / calidad (ranking combinado de precio, merma y devol.)
+if len(pv) >= 2:
+    sc = pv.copy()
+    sc["r_precio"] = sc["Precio Bs/kg"].rank()
+    sc["r_merma"] = sc["% Merma (util)"].rank()
+    sc["r_devol"] = sc["% Devol."].rank()
+    sc["score"] = sc[["r_precio", "r_merma", "r_devol"]].sum(axis=1)
+    best = sc.sort_values("score").iloc[0]
+    st.markdown(
+        f"<div class='alert-box alert-ok'>🏅 <b>Mejor relación precio/calidad: "
+        f"{best['Proveedor']}</b> — Bs {best['Precio Bs/kg']:,.2f}/kg · "
+        f"{best['% Merma (util)']:.1f}% merma · {best['% Devol.']:.1f}% devolución</div>",
+        unsafe_allow_html=True)
 
 st.markdown("---")
 
@@ -513,15 +620,20 @@ wk["% MERMA"] = np.where(wk["UTILIZABLE"] > 0,
 wk["SEM_LBL"] = wk["SEMANA"].dt.strftime("%d/%m")
 
 fig_w = go.Figure()
-fig_w.add_trace(go.Bar(x=wk["SEM_LBL"], y=wk["MERMA_LIMPIEZA"],
-                       name="Merma limpieza (kg)", marker_color=C_RED))
-fig_w.add_trace(go.Bar(x=wk["SEM_LBL"], y=wk["DEVOLUCION"],
-                       name="Devolución (kg)", marker_color=C_YELLOW))
-fig_w.add_trace(go.Scatter(x=wk["SEM_LBL"], y=wk["% MERMA"], name="% Merma util",
-                           mode="lines+markers", yaxis="y2",
-                           line=dict(color=C_CYAN, width=3)))
+fig_w.add_trace(go.Bar(
+    x=wk["SEM_LBL"], y=wk["MERMA_LIMPIEZA"], name="Merma limpieza (kg)",
+    marker_color=C_RED,
+    hovertemplate="Semana %{x}<br>Merma limpieza: %{y:,.0f} kg<extra></extra>"))
+fig_w.add_trace(go.Bar(
+    x=wk["SEM_LBL"], y=wk["DEVOLUCION"], name="Devolución (kg)",
+    marker_color=C_YELLOW,
+    hovertemplate="Semana %{x}<br>Devolución: %{y:,.0f} kg<extra></extra>"))
+fig_w.add_trace(go.Scatter(
+    x=wk["SEM_LBL"], y=wk["% MERMA"], name="% Merma util",
+    mode="lines+markers", yaxis="y2", line=dict(color=C_CYAN, width=3),
+    hovertemplate="Semana %{x}<br>%% Merma util: %{y:.1f}%<extra></extra>"))
 fig_w.update_layout(
-    template=PLOTLY_TEMPLATE, height=380, barmode="group",
+    template=PLOTLY_TEMPLATE, height=380, barmode="group", hovermode="x unified",
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
     legend=dict(orientation="h", y=1.12, x=0),
     margin=dict(l=10, r=10, t=30, b=10),
